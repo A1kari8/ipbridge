@@ -76,7 +76,7 @@ use crossbeam_queue::SegQueue;
 /// allocations when the number of concurrent connections is small. Tracks simple
 /// statistics: total allocations, reuses, and current pool size.
 #[derive(Debug)]
-struct BufferPool {
+pub struct BufferPool {
     inner: Arc<SegQueue<BytesMut>>,
     allocated: Arc<AtomicUsize>,
     reused: Arc<AtomicUsize>,
@@ -84,14 +84,14 @@ struct BufferPool {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct PoolStats {
+pub struct PoolStats {
     pub allocated: usize,
     pub reused: usize,
     pub pool_size: usize,
 }
 
 impl BufferPool {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(SegQueue::new()),
             allocated: Arc::new(AtomicUsize::new(0)),
@@ -100,7 +100,7 @@ impl BufferPool {
         }
     }
 
-    fn get(&self) -> BytesMut {
+    pub fn get(&self) -> BytesMut {
         match self.inner.pop() {
             Some(b) => {
                 self.reused.fetch_add(1, Ordering::Relaxed);
@@ -116,13 +116,13 @@ impl BufferPool {
         }
     }
 
-    fn put(&self, mut buf: BytesMut) {
+    pub fn put(&self, mut buf: BytesMut) {
         buf.resize(BUF_SIZE, 0);
         self.pool_size.fetch_add(1, Ordering::Relaxed);
         self.inner.push(buf);
     }
 
-    fn stats(&self) -> PoolStats {
+    pub fn stats(&self) -> PoolStats {
         PoolStats {
             allocated: self.allocated.load(Ordering::Relaxed),
             reused: self.reused.load(Ordering::Relaxed),
@@ -133,13 +133,13 @@ impl BufferPool {
 
 /// RAII guard that returns buffer to pool on Drop. This ensures buffers are
 /// returned even if the task is cancelled.
-struct BufferGuard {
+pub struct BufferGuard {
     pool: Arc<BufferPool>,
     buf: Option<BytesMut>,
 }
 
 impl BufferGuard {
-    fn new(pool: Arc<BufferPool>) -> Self {
+    pub fn new(pool: Arc<BufferPool>) -> Self {
         let buf = pool.get();
         Self {
             pool,

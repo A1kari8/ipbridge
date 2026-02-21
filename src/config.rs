@@ -11,8 +11,8 @@ pub struct TunnelConfig {
 pub struct Tunnel {
     pub protocol: Protocol,
     /// 角色含义（仅 UDP 需要）
-    /// - server: 桥部署在“靠近游戏客户端”一侧，监听 listen，转发到 forward
-    /// - client: 桥部署在“靠近游戏服务器”一侧，远端连接 forward，本地暴露 listen
+    /// - server: 程序充当服务端部署在靠近游戏客户端一侧，监听 listen，转发到 forward
+    /// - client: 程序充当客户端部署在靠近游戏服务器一侧，监听 forward，转发到 listen
     /// 这里的 server/client 是桥所处侧的标记，不是游戏真实的 Server/Client 进程
     #[serde(default)]
     pub role: Option<Role>,
@@ -49,16 +49,14 @@ impl TunnelConfig {
         if !Path::new(path).exists() {
             let template = r#"# 配置模板 (TOML)
 #
-# 角色说明（仅 UDP 需要）：这里的 server/client 描述桥所在的侧，不是游戏真实的 Server/Client
-# - server: 桥在靠近“游戏客户端”一侧；监听 listen，转发到 forward
-# - client: 桥在靠近游戏服务器一侧；监听/暴露 listen，远端连接 forward
+# 角色说明（仅 UDP 需要）：server/client 描述桥所在的侧，不是游戏真实的 Server/Client
+# - server: 程序充当服务端部署在靠近游戏客户端一侧，监听 listen，转发到 forward
+# - client: 程序充当客户端部署在靠近游戏服务器一侧，监听 forward，转发到 listen
 #
 # 协议说明：
 # - udp / tcp 均可；udp 支持一对多的 server 会话，client 侧限制单客户端
 # - TCP 可省略 role 
 #
-# 典型 IPv4 -> IPv6 -> IPv4 桥接示例：
-#  游戏客户端 (IPv4) --本地-> server 端 listen (IPv4) --隧道-> client 端 forward (IPv6) --本地-> 游戏服务器 (IPv4)
 
 [[tunnel]]
 protocol = "udp"            # 协议：udp / tcp
