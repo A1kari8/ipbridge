@@ -400,31 +400,31 @@ fn fmt_tunnel_header(tunnel: &Tunnel) -> String {
     format!("[{}] {} -> {}", label, tunnel.listen, tunnel.forward)
 }
 
-macro_rules! ok   { ($($t:tt)*) => { format!("  \x1b[32m[ok]\x1b[0m {}", format!($($t)*)) } }
-macro_rules! fail { ($($t:tt)*) => { format!("  \x1b[31m[fail]\x1b[0m {}", format!($($t)*)) } }
-macro_rules! warn { ($($t:tt)*) => { format!("  \x1b[33m[warn]\x1b[0m {}", format!($($t)*)) } }
-
 pub async fn check_tunnel(tunnel: &Tunnel) {
+    let ok = |s: String| format!("  \x1b[32m[ok]\x1b[0m {s}");
+    let fail = |s: String| format!("  \x1b[31m[fail]\x1b[0m {s}");
+    let warn = |s: String| format!("  \x1b[33m[warn]\x1b[0m {s}");
+
     println!("{}", fmt_tunnel_header(tunnel));
 
     let listen_addr = match safe_resolve(&tunnel.listen) {
         Some(a) => {
-            println!("{}", ok!("listen resolves to {}", a));
+            println!("{}", ok(format!("listen resolves to {a}")));
             a
         }
         None => {
-            println!("{}", fail!("listen DNS resolution failed"));
+            println!("{}", fail("listen DNS resolution failed".into()));
             return;
         }
     };
 
     let target_addr = match safe_resolve(&tunnel.forward) {
         Some(a) => {
-            println!("{}", ok!("forward resolves to {}", a));
+            println!("{}", ok(format!("forward resolves to {a}")));
             a
         }
         None => {
-            println!("{}", fail!("forward DNS resolution failed"));
+            println!("{}", fail("forward DNS resolution failed".into()));
             return;
         }
     };
@@ -432,8 +432,8 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
     match tunnel.protocol {
         Protocol::Tcp => {
             match TcpListener::bind(listen_addr).await {
-                Ok(_) => println!("{}", ok!("listen port available")),
-                Err(e) => println!("{}", fail!("listen port unavailable: {}", e)),
+                Ok(_) => println!("{}", ok("listen port available".into())),
+                Err(e) => println!("{}", fail(format!("listen port unavailable: {e}"))),
             }
             match tokio::time::timeout(
                 Duration::from_secs(3),
@@ -441,55 +441,55 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
             )
             .await
             {
-                Ok(Ok(_)) => println!("{}", ok!("TCP connect succeeded")),
-                Ok(Err(e)) => println!("{}", fail!("TCP connect failed: {}", e)),
-                Err(_) => println!("{}", fail!("TCP connect timed out (3s)")),
+                Ok(Ok(_)) => println!("{}", ok("TCP connect succeeded".into())),
+                Ok(Err(e)) => println!("{}", fail(format!("TCP connect failed: {e}"))),
+                Err(_) => println!("{}", fail("TCP connect timed out (3s)".into())),
             }
         }
         Protocol::Udp => {
             match UdpSocket::bind(listen_addr).await {
                 Ok(s) => drop(s),
                 Err(e) => {
-                    println!("{}", fail!("listen port unavailable: {}", e));
+                    println!("{}", fail(format!("listen port unavailable: {e}")));
                     return;
                 }
             }
-            println!("{}", ok!("listen port available"));
+            println!("{}", ok("listen port available".into()));
 
             let probe = match UdpSocket::bind(unspecified_addr(target_addr)).await {
                 Ok(s) => s,
                 Err(e) => {
-                    println!("{}", fail!("cannot create probe socket: {}", e));
+                    println!("{}", fail(format!("cannot create probe socket: {e}")));
                     return;
                 }
             };
 
             if let Err(e) = probe.send_to(HEARTBEAT_MAGIC, target_addr).await {
-                println!("{}", fail!("heartbeat send failed: {}", e));
+                println!("{}", fail(format!("heartbeat send failed: {e}")));
                 return;
             }
 
             let mut buf = vec![0u8; HEARTBEAT_MAGIC.len()];
             match tokio::time::timeout(Duration::from_secs(2), probe.recv_from(&mut buf)).await {
                 Ok(Ok((n, src))) if n == HEARTBEAT_MAGIC.len() && buf[..n] == *HEARTBEAT_MAGIC => {
-                    println!("{}", ok!("heartbeat echo from {} (ipbridge running)", src));
+                    println!(
+                        "{}",
+                        ok(format!("heartbeat echo from {src} (ipbridge running)"))
+                    );
                 }
                 Ok(Ok((n, src))) => {
                     println!(
                         "{}",
-                        warn!("response from {} ({n} bytes) not a valid heartbeat", src)
+                        warn(format!(
+                            "response from {src} ({n} bytes) not a valid heartbeat"
+                        ))
                     );
                 }
                 Ok(Err(e)) => {
-                    println!("{}", warn!("heartbeat receive error: {}", e));
+                    println!("{}", warn(format!("heartbeat receive error: {e}")));
                 }
                 Err(_) => {
-                    println!(
-                        "{}",
-                        warn!(
-                            "no heartbeat response within 2s (ipbridge may not be running on the remote end)"
-                        )
-                    );
+                    println!("{}", warn("no heartbeat response within 2s (ipbridge may not be running on the remote end)".into()));
                 }
             }
         }
