@@ -405,22 +405,22 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
 
     let listen_addr = match safe_resolve(&tunnel.listen) {
         Some(a) => {
-            println!("  ✓ listen resolves to {}", a);
+            println!("  [ok] listen resolves to {}", a);
             a
         }
         None => {
-            println!("  ✗ listen DNS resolution failed");
+            println!("  [fail] listen DNS resolution failed");
             return;
         }
     };
 
     let target_addr = match safe_resolve(&tunnel.forward) {
         Some(a) => {
-            println!("  ✓ forward resolves to {}", a);
+            println!("  [ok] forward resolves to {}", a);
             a
         }
         None => {
-            println!("  ✗ forward DNS resolution failed");
+            println!("  [fail] forward DNS resolution failed");
             return;
         }
     };
@@ -428,8 +428,8 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
     match tunnel.protocol {
         Protocol::Tcp => {
             match TcpListener::bind(listen_addr).await {
-                Ok(_) => println!("  ✓ listen port available"),
-                Err(e) => println!("  ✗ listen port unavailable: {}", e),
+                Ok(_) => println!("  [ok] listen port available"),
+                Err(e) => println!("  [fail] listen port unavailable: {}", e),
             }
             match tokio::time::timeout(
                 Duration::from_secs(3),
@@ -437,51 +437,51 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
             )
             .await
             {
-                Ok(Ok(_)) => println!("  ✓ TCP connect succeeded"),
-                Ok(Err(e)) => println!("  ✗ TCP connect failed: {}", e),
-                Err(_) => println!("  ✗ TCP connect timed out (3s)"),
+                Ok(Ok(_)) => println!("  [ok] TCP connect succeeded"),
+                Ok(Err(e)) => println!("  [fail] TCP connect failed: {}", e),
+                Err(_) => println!("  [fail] TCP connect timed out (3s)"),
             }
         }
         Protocol::Udp => {
             match UdpSocket::bind(listen_addr).await {
                 Ok(s) => drop(s),
                 Err(e) => {
-                    println!("  ✗ listen port unavailable: {}", e);
+                    println!("  [fail] listen port unavailable: {}", e);
                     return;
                 }
             }
-            println!("  ✓ listen port available");
+            println!("  [ok] listen port available");
 
             let probe = match UdpSocket::bind(unspecified_addr(target_addr)).await {
                 Ok(s) => s,
                 Err(e) => {
-                    println!("  ✗ cannot create probe socket: {}", e);
+                    println!("  [fail] cannot create probe socket: {}", e);
                     return;
                 }
             };
 
             if let Err(e) = probe.send_to(HEARTBEAT_MAGIC, target_addr).await {
-                println!("  ✗ heartbeat send failed: {}", e);
+                println!("  [fail] heartbeat send failed: {}", e);
                 return;
             }
 
             let mut buf = vec![0u8; HEARTBEAT_MAGIC.len()];
             match tokio::time::timeout(Duration::from_secs(2), probe.recv_from(&mut buf)).await {
                 Ok(Ok((n, src))) if n == HEARTBEAT_MAGIC.len() && buf[..n] == *HEARTBEAT_MAGIC => {
-                    println!("  ✓ heartbeat echo from {} (ipbridge running)", src);
+                    println!("  [ok] heartbeat echo from {} (ipbridge running)", src);
                 }
                 Ok(Ok((n, src))) => {
                     println!(
-                        "  ⚠ response from {} ({n} bytes) not a valid heartbeat",
+                        "  [warn] response from {} ({n} bytes) not a valid heartbeat",
                         src
                     );
                 }
                 Ok(Err(e)) => {
-                    println!("  ⚠ heartbeat receive error: {}", e);
+                    println!("  [warn] heartbeat receive error: {}", e);
                 }
                 Err(_) => {
                     println!(
-                        "  ⚠ no heartbeat response within 2s (ipbridge may not be running on the remote end)"
+                        "  [warn] no heartbeat response within 2s (ipbridge may not be running on the remote end)"
                     );
                 }
             }
