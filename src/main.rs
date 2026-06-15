@@ -14,12 +14,17 @@ fn exit(msg: &str) -> ! {
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
-
     let cli = Cli::parse();
     let config_path = cli.config_path();
+
+    match &cli.command {
+        Some(Command::Check) => {}
+        _ => {
+            env_logger::Builder::from_default_env()
+                .filter_level(log::LevelFilter::Info)
+                .init();
+        }
+    }
 
     match cli.command {
         Some(Command::Init { force }) => match TunnelConfig::create_template(&config_path, force) {

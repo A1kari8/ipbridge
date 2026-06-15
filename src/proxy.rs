@@ -39,7 +39,7 @@ fn new_tcp_socket(addr: SocketAddr) -> Result<TcpSocket, tokio::io::Error> {
     }
 }
 
-fn configure_tcp_socket(socket: &TcpSocket, _addr: SocketAddr) {
+fn configure_tcp_socket(socket: &TcpSocket) {
     let _ = socket.set_nodelay(true);
     let _ = socket.set_send_buffer_size(TCP_SND_BUF as u32);
     let _ = socket.set_recv_buffer_size(TCP_RCV_BUF as u32);
@@ -54,7 +54,7 @@ async fn connect_tcp(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
             return None;
         }
     };
-    configure_tcp_socket(&socket, addr);
+    configure_tcp_socket(&socket);
     match socket.connect(addr).await {
         Ok(stream) => Some(stream),
         Err(e) => {
@@ -106,6 +106,15 @@ pub async fn run_server_udp_tunnel(tunnel: Tunnel) {
 
     let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    let cleanup = sessions.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SESSION_TIMEOUT).await;
+            cleanup_expired(&cleanup);
+        }
+    });
+
     let mut buf = vec![0u8; BUF_SIZE];
 
     loop {
@@ -238,10 +247,6 @@ pub async fn run_client_udp_tunnel(tunnel: Tunnel) {
             .await
             .expect("UDP client bind failed"),
     );
-    upstream
-        .connect(remote_addr)
-        .await
-        .expect("UDP client connect failed");
     info!("UDP client forwarding to {}", remote_addr);
 
     let local_addr = resolve_addr(&tunnel.listen, "udp client listen");
@@ -272,9 +277,9 @@ pub async fn run_client_udp_tunnel(tunnel: Tunnel) {
             continue;
         }
 
-        session = handle_client_session(session, game_client_src, &ctx);
+        session = handle_client_session(session, game_client_src, &ctx, remote_addr);
 
-        if let Err(e) = ctx.upstream.send(&buf[..n]).await {
+        if let Err(e) = ctx.upstream.send_to(&buf[..n], remote_addr).await {
             warn!("Failed to send packet to {}: {}", remote_addr, e);
         }
     }
@@ -284,6 +289,7 @@ fn handle_client_session(
     current: Option<UdpClientSession>,
     game_client_src: SocketAddr,
     ctx: &UdpClientCtx,
+    remote_addr: SocketAddr,
 ) -> Option<UdpClientSession> {
     if let Some(client) = current {
         if Instant::now().duration_since(client.last_active) > SESSION_TIMEOUT {
@@ -308,12 +314,13 @@ fn handle_client_session(
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
-            match upstream.recv(&mut buf).await {
-                Ok(n) => {
+            match upstream.recv_from(&mut buf).await {
+                Ok((n, src)) if src == remote_addr => {
                     if let Err(e) = local.send_to(&buf[..n], game_client_src).await {
                         warn!("Failed to send response to {}: {}", game_client_src, e);
                     }
                 }
+                Ok(_) => {}
                 Err(e) => warn!("Response receive error: {}", e),
             }
         }
@@ -503,11 +510,12 @@ mod tests {
     #[tokio::test]
     async fn handle_client_session_new_and_conflict() {
         let game_client_src: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
         let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let ctx = UdpClientCtx { upstream, local };
 
-        let session = handle_client_session(None, game_client_src, &ctx);
+        let session = handle_client_session(None, game_client_src, &ctx, remote_addr);
         assert!(session.is_some());
         assert_eq!(session.as_ref().unwrap().client_addr, game_client_src);
 
@@ -521,7 +529,7 @@ mod tests {
             last_active: tokio::time::Instant::now(),
             response_task: handle,
         };
-        let session2 = handle_client_session(Some(existing), game_client_src, &ctx);
+        let session2 = handle_client_session(Some(existing), game_client_src, &ctx, remote_addr);
         assert!(session2.is_some());
         assert_eq!(
             session2.unwrap().client_addr,
@@ -532,6 +540,7 @@ mod tests {
     #[tokio::test]
     async fn handle_client_session_expired() {
         let game_client_src: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
         let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let ctx = UdpClientCtx { upstream, local };
@@ -546,7 +555,120 @@ mod tests {
             last_active: tokio::time::Instant::now() - Duration::from_secs(61),
             response_task: handle,
         };
-        let session = handle_client_session(Some(expired), game_client_src, &ctx);
+        let session = handle_client_session(Some(expired), game_client_src, &ctx, remote_addr);
         assert!(session.is_none());
+    }
+
+    #[test]
+    fn test_unspecified_addr_v4() {
+        let target: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        let result = unspecified_addr(target);
+        assert_eq!(result.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(result.port(), 0);
+    }
+
+    #[test]
+    fn test_unspecified_addr_v6() {
+        let target: SocketAddr = "[::1]:5678".parse().unwrap();
+        let result = unspecified_addr(target);
+        assert_eq!(result.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(result.port(), 0);
+    }
+
+    #[test]
+    fn test_safe_resolve_valid() {
+        assert!(safe_resolve("127.0.0.1:0").is_some());
+    }
+
+    #[test]
+    fn test_safe_resolve_invalid_port() {
+        assert!(safe_resolve("127.0.0.1:99999").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_removes_stale_sessions() {
+        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let dummy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        sessions.lock().unwrap().insert(
+            addr,
+            UdpServerSession {
+                socket: dummy,
+                last_active: Instant::now() - Duration::from_secs(61),
+                response_task: handle,
+            },
+        );
+
+        cleanup_expired(&sessions);
+
+        assert!(sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_keeps_active_sessions() {
+        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let addr: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let dummy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        sessions.lock().unwrap().insert(
+            addr,
+            UdpServerSession {
+                socket: dummy,
+                last_active: Instant::now(),
+                response_task: handle,
+            },
+        );
+
+        cleanup_expired(&sessions);
+
+        assert_eq!(sessions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_existing_updates_last_active() {
+        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let addr: SocketAddr = "127.0.0.1:10003".parse().unwrap();
+        let dummy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        let old = Instant::now() - Duration::from_secs(30);
+        sessions.lock().unwrap().insert(
+            addr,
+            UdpServerSession {
+                socket: dummy,
+                last_active: old,
+                response_task: handle,
+            },
+        );
+
+        let result = refresh_existing(&sessions, addr);
+        assert!(result.is_some());
+
+        let map = sessions.lock().unwrap();
+        let session = map.get(&addr).unwrap();
+        assert!(session.last_active > old);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_existing_returns_none_for_unknown() {
+        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let addr: SocketAddr = "127.0.0.1:10004".parse().unwrap();
+        assert!(refresh_existing(&sessions, addr).is_none());
     }
 }

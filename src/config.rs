@@ -40,7 +40,7 @@ const TEMPLATE: &str = r#"# 配置模板 (TOML)
 #
 # 角色说明（仅 UDP 需要）：
 # - server: 桥在靠近游戏客户端一侧，监听 listen，转发到 forward
-# - client: 桥在靠近游戏服务器一侧，监听 forward，转发到 listen
+# - client: 桥在靠近游戏服务器一侧，监听 listen，转发到 forward
 #
 # 协议说明：
 # - udp / tcp 均可；udp 支持一对多的 server 会话，client 侧限制单客户端
