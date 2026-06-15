@@ -3,9 +3,14 @@ mod config;
 mod proxy;
 
 use clap::Parser;
-use cli::Cli;
+use cli::{Cli, Command};
 use config::TunnelConfig;
 use proxy::run_proxy;
+
+fn exit(msg: &str) -> ! {
+    eprintln!("Error: {}", msg);
+    std::process::exit(1);
+}
 
 #[tokio::main]
 async fn main() {
@@ -15,24 +20,30 @@ async fn main() {
 
     let cli = Cli::parse();
     let config_path = cli.config_path();
-    let config = TunnelConfig::load_or_create(config_path.to_str().unwrap());
-    let proxy_task = tokio::spawn(run_proxy(config));
 
-    // Ctrl+C 双击退出
-    tokio::spawn(async {
-        let mut first = true;
-        loop {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to listen for ctrl_c");
-            if first {
-                eprintln!("再按一次Ctrl+C退出");
-                first = false;
-            } else {
-                std::process::exit(0);
+    match cli.command {
+        Some(Command::Init { force }) => match TunnelConfig::create_template(&config_path, force) {
+            Ok(()) => {
+                eprintln!("Config template generated at {}", config_path.display());
+            }
+            Err(e) => exit(&e.to_string()),
+        },
+        Some(Command::Check) => {
+            let config = TunnelConfig::load(&config_path).unwrap_or_else(|e| exit(&e.to_string()));
+            for tunnel in &config.tunnel {
+                proxy::check_tunnel(tunnel).await;
+                println!();
             }
         }
-    });
+        Some(Command::Run) | None => {
+            let config = TunnelConfig::load(&config_path).unwrap_or_else(|e| exit(&e.to_string()));
 
-    proxy_task.await.expect("Proxy task panicked");
+            tokio::spawn(async {
+                tokio::signal::ctrl_c().await.unwrap();
+                std::process::exit(0);
+            });
+
+            run_proxy(config).await;
+        }
+    }
 }
