@@ -25,10 +25,15 @@ fn resolve_addr(addr: &str, label: &str) -> SocketAddr {
         .unwrap_or_else(|| panic!("Failed to resolve {} address: {}", label, addr))
 }
 
-fn unspecified_addr(target: SocketAddr) -> SocketAddr {
-    match target {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+/// 先尝试绑定 IPv6 地址，如果失败再尝试 IPv4
+async fn bind_udp_any() -> std::io::Result<UdpSocket> {
+    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    match UdpSocket::bind(v6).await {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+            UdpSocket::bind(v4).await
+        }
     }
 }
 
@@ -198,7 +203,7 @@ fn refresh_existing(
 
 async fn new_outbound() -> Arc<UdpSocket> {
     Arc::new(
-        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        bind_udp_any()
             .await
             .expect("Failed to bind outbound UDP socket"),
     )
@@ -242,11 +247,7 @@ struct UdpClientCtx {
 pub async fn run_client_udp_tunnel(tunnel: Tunnel) {
     let remote_addr = resolve_addr(&tunnel.forward, "udp remote");
 
-    let upstream = Arc::new(
-        UdpSocket::bind(unspecified_addr(remote_addr))
-            .await
-            .expect("UDP client bind failed"),
-    );
+    let upstream = Arc::new(bind_udp_any().await.expect("UDP client bind failed"));
     info!("UDP client forwarding to {}", remote_addr);
 
     let local_addr = resolve_addr(&tunnel.listen, "udp client listen");
@@ -456,7 +457,7 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
             }
             println!("{}", ok("listen port available".into()));
 
-            let probe = match UdpSocket::bind(unspecified_addr(target_addr)).await {
+            let probe = match bind_udp_any().await {
                 Ok(s) => s,
                 Err(e) => {
                     println!("{}", fail(format!("cannot create probe socket: {e}")));
@@ -564,22 +565,6 @@ mod tests {
         };
         let session = handle_client_session(Some(expired), game_client_src, &ctx, remote_addr);
         assert!(session.is_none());
-    }
-
-    #[test]
-    fn test_unspecified_addr_v4() {
-        let target: SocketAddr = "1.2.3.4:5678".parse().unwrap();
-        let result = unspecified_addr(target);
-        assert_eq!(result.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert_eq!(result.port(), 0);
-    }
-
-    #[test]
-    fn test_unspecified_addr_v6() {
-        let target: SocketAddr = "[::1]:5678".parse().unwrap();
-        let result = unspecified_addr(target);
-        assert_eq!(result.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-        assert_eq!(result.port(), 0);
     }
 
     #[test]
