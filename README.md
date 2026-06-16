@@ -1,8 +1,5 @@
 # ipbridge
 
-> [!WARNING]
-> UDP 模式尚未充分测试，可能无法使用
-
 极简 TCP/UDP 隧道转发工具，支持 IPv4/IPv6 双栈桥接
 
 ## 场景
@@ -14,7 +11,7 @@
 ## 功能
 
 - **TCP 隧道**：透明双向转发，支持多并发连接
-- **UDP 隧道**
+- **UDP 隧道**：NAT session 管理、自适应超时
 - **连通性检测**：`ipbridge check` 验证配置并测试远程端是否存活
 - **双栈支持**：IPv4 / IPv6 地址任意组合
 - **配置驱动**：TOML 配置文件，`ipbridge init` 生成模板
@@ -49,7 +46,31 @@ enable = true
 # enable = true
 ```
 
-参数说明：
+### 常见部署示例
+
+#### 服务端用户
+
+```toml
+[[tunnel]]
+protocol = "udp"
+listen = "[::]:7777"
+forward = "<服务端应用监听地址>" # 例：127.0.0.1:8888
+enable = true
+```
+
+#### 客户端用户
+
+```toml
+[[tunnel]]
+protocol = "udp"
+listen = "0.0.0.0:7777"
+forward = "<服务端公网地址>:7777"
+enable = true
+```
+
+客户端应用连接时填写 `127.0.0.1:7777` 即可，`ipbridge` 会双向转发数据
+
+### 参数说明
 
 | 字段 | 说明 |
 |------|------|

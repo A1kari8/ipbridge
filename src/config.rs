@@ -32,8 +32,8 @@ const TEMPLATE: &str = r#"# 配置模板 (TOML)
 # UDP 隧道
 [[tunnel]]
 protocol = "udp"
-listen = "0.0.0.0:7777"
-forward = "[2001:db8::1]:8888"
+listen = "[::]:7777"
+forward = "127.0.0.1:8888"
 enable = true
 
 # TCP 隧道
