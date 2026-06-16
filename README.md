@@ -1,7 +1,7 @@
 # ipbridge
 
 > [!WARNING]
-> UDP 模式尚未测试，可能无法使用
+> UDP 模式尚未充分测试，可能无法使用
 
 极简 TCP/UDP 隧道转发工具，支持 IPv4/IPv6 双栈桥接
 
