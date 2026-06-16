@@ -38,16 +38,8 @@
 ```toml
 [[tunnel]]
 protocol = "udp"
-role = "server"
-listen = "0.0.0.0:7777"
-forward = "[2001:db8::1]:8888"
-enable = true
-
-[[tunnel]]
-protocol = "udp"
-role = "client"
-listen = "127.0.0.1:54321"
-forward = "[2001:db8::1]:8888"
+listen = "[::]:7777"
+forward = "127.0.0.1:8888"
 enable = true
 
 # [[tunnel]]
@@ -62,7 +54,6 @@ enable = true
 | 字段 | 说明 |
 |------|------|
 | `protocol` | `tcp` 或 `udp` |
-| `role` | UDP 时必填：`server` 或 `client` |
 | `listen` | 本地监听地址 |
 | `forward` | 转发目标地址（支持域名） |
 | `enable` | 是否启用该隧道，默认 `true` |

@@ -1,4 +1,4 @@
-use crate::config::{Protocol, Role, Tunnel, TunnelConfig};
+use crate::config::{Protocol, Tunnel, TunnelConfig};
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -23,18 +23,6 @@ fn resolve_addr(addr: &str, label: &str) -> SocketAddr {
         .ok()
         .and_then(|mut iter| iter.next())
         .unwrap_or_else(|| panic!("Failed to resolve {} address: {}", label, addr))
-}
-
-/// 先尝试绑定 IPv6 地址，如果失败再尝试 IPv4
-async fn bind_udp_any() -> std::io::Result<UdpSocket> {
-    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-    match UdpSocket::bind(v6).await {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-            UdpSocket::bind(v4).await
-        }
-    }
 }
 
 fn new_tcp_socket(addr: SocketAddr) -> Result<TcpSocket, tokio::io::Error> {
@@ -69,6 +57,21 @@ async fn connect_tcp(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
     }
 }
 
+async fn new_outbound() -> Arc<UdpSocket> {
+    Arc::new(bind_udp_any().await.expect("Failed to bind UDP socket"))
+}
+
+async fn bind_udp_any() -> std::io::Result<UdpSocket> {
+    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    match UdpSocket::bind(v6).await {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+            UdpSocket::bind(v4).await
+        }
+    }
+}
+
 // ===== Top-level =====
 
 pub async fn run_proxy(config: TunnelConfig) {
@@ -76,11 +79,7 @@ pub async fn run_proxy(config: TunnelConfig) {
 
     for tunnel in config.tunnel.into_iter().filter(|t| t.enable) {
         match tunnel.protocol {
-            Protocol::Udp => match tunnel.role {
-                Some(Role::Server) => handles.push(tokio::spawn(run_server_udp_tunnel(tunnel))),
-                Some(Role::Client) => handles.push(tokio::spawn(run_client_udp_tunnel(tunnel))),
-                None => warn!("UDP tunnel skipped: role field is required"),
-            },
+            Protocol::Udp => handles.push(tokio::spawn(run_udp_tunnel(tunnel))),
             Protocol::Tcp => handles.push(tokio::spawn(run_tcp_tunnel(tunnel))),
         }
     }
@@ -90,273 +89,125 @@ pub async fn run_proxy(config: TunnelConfig) {
     }
 }
 
-// ===== UDP Server =====
+// ===== UDP Tunnel =====
 
-struct UdpServerSession {
+struct UdpSession {
     socket: Arc<UdpSocket>,
     last_active: Instant,
     response_task: JoinHandle<()>,
 }
 
-pub async fn run_server_udp_tunnel(tunnel: Tunnel) {
-    let listen_addr = resolve_addr(&tunnel.listen, "udp server listen");
+pub async fn run_udp_tunnel(tunnel: Tunnel) {
+    let listen_addr = resolve_addr(&tunnel.listen, "udp listen");
     let target_addr = resolve_addr(&tunnel.forward, "udp target");
 
     let listener = Arc::new(
         UdpSocket::bind(listen_addr)
             .await
-            .expect("UDP server bind failed"),
+            .expect("UDP bind failed"),
     );
-    info!("UDP server listening on {} -> {}", listen_addr, target_addr);
+    info!("UDP tunnel listening on {} -> {}", listen_addr, target_addr);
 
-    let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
+    let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     let cleanup = sessions.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(SESSION_TIMEOUT).await;
-            cleanup_expired_sessions(&cleanup);
+            cleanup_expired(&cleanup);
         }
     });
 
     let mut buf = vec![0u8; BUF_SIZE];
 
     loop {
-        let (n, client_addr) = match listener.recv_from(&mut buf).await {
+        let (n, src_addr) = match listener.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
-                warn!("UDP server receive error: {}", e);
+                warn!("UDP receive error: {}", e);
                 continue;
             }
         };
 
         if n == HEARTBEAT_MAGIC.len() && &buf[..n] == HEARTBEAT_MAGIC {
-            if let Err(e) = listener.send_to(HEARTBEAT_MAGIC, client_addr).await {
+            if let Err(e) = listener.send_to(HEARTBEAT_MAGIC, src_addr).await {
                 warn!("Heartbeat echo failed: {}", e);
             }
             continue;
         }
 
-        let outbound =
-            get_or_create_server_session(&sessions, client_addr, target_addr, listener.clone())
-                .await;
+        let session = get_or_create_session(&sessions, src_addr, listener.clone()).await;
 
-        if let Err(e) = outbound.send_to(&buf[..n], target_addr).await {
+        if let Err(e) = session.send_to(&buf[..n], target_addr).await {
             warn!("Failed to send packet to {}: {}", target_addr, e);
         }
     }
 }
 
-async fn get_or_create_server_session(
-    sessions: &Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>>,
-    client_addr: SocketAddr,
-    target_addr: SocketAddr,
+async fn get_or_create_session(
+    sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSession>>>,
+    src_addr: SocketAddr,
     listener: Arc<UdpSocket>,
 ) -> Arc<UdpSocket> {
-    cleanup_expired_sessions(sessions);
+    cleanup_expired(sessions);
 
     {
         let mut map = sessions.lock().unwrap();
-        if let Some(session) = map.get_mut(&client_addr) {
+        if let Some(session) = map.get_mut(&src_addr) {
             session.last_active = Instant::now();
             return session.socket.clone();
         }
     }
 
     let socket = new_outbound().await;
-    let response_task = spawn_server_response(socket.clone(), listener, client_addr, target_addr);
+    let response_task = spawn_session_response(socket.clone(), listener, src_addr);
 
     sessions.lock().unwrap().insert(
-        client_addr,
-        UdpServerSession {
+        src_addr,
+        UdpSession {
             socket: socket.clone(),
             last_active: Instant::now(),
             response_task,
         },
     );
 
-    info!("New UDP session for client {}", client_addr);
+    info!("New UDP session for peer {}", src_addr);
     socket
 }
 
-async fn new_outbound() -> Arc<UdpSocket> {
-    Arc::new(
-        bind_udp_any()
-            .await
-            .expect("Failed to bind outbound UDP socket"),
-    )
-}
-
-fn spawn_server_response(
-    outbound: Arc<UdpSocket>,
+fn spawn_session_response(
+    session_socket: Arc<UdpSocket>,
     listener: Arc<UdpSocket>,
-    client_addr: SocketAddr,
-    _target_addr: SocketAddr,
+    peer_addr: SocketAddr,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
-            match outbound.recv_from(&mut buf).await {
+            match session_socket.recv_from(&mut buf).await {
                 Ok((n, _)) => {
-                    if let Err(e) = listener.send_to(&buf[..n], client_addr).await {
-                        warn!("Failed to send response to {}: {}", client_addr, e);
+                    if let Err(e) = listener.send_to(&buf[..n], peer_addr).await {
+                        warn!("Failed to send response to {}: {}", peer_addr, e);
                     }
                 }
-                Err(e) => warn!("Response receive error: {}", e),
+                Err(e) => warn!("Session receive error: {}", e),
             }
         }
     })
 }
 
-// ===== UDP Client =====
-
-struct ClientSession {
-    upstream: Arc<UdpSocket>,
-    last_active: Instant,
-    response_task: JoinHandle<()>,
-}
-
-pub async fn run_client_udp_tunnel(tunnel: Tunnel) {
-    let remote_addr = resolve_addr(&tunnel.forward, "udp remote");
-
-    let local_addr = resolve_addr(&tunnel.listen, "udp client listen");
-    let local = Arc::new(
-        UdpSocket::bind(local_addr)
-            .await
-            .unwrap_or_else(|_| panic!("UDP client listen bind {} failed", tunnel.listen)),
-    );
-    info!("UDP client listening on {}", local_addr);
-
-    let sessions: Arc<Mutex<HashMap<SocketAddr, ClientSession>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    let cleanup = sessions.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(SESSION_TIMEOUT).await;
-            cleanup_expired_sessions(&cleanup);
-        }
-    });
-
-    let mut buf = vec![0u8; BUF_SIZE];
-
-    loop {
-        let (n, game_server_addr) = match local.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("UDP client receive error: {}", e);
-                continue;
-            }
-        };
-
-        if n == HEARTBEAT_MAGIC.len() && &buf[..n] == HEARTBEAT_MAGIC {
-            if let Err(e) = local.send_to(HEARTBEAT_MAGIC, game_server_addr).await {
-                warn!("Heartbeat echo failed: {}", e);
-            }
-            continue;
-        }
-
-        let upstream =
-            get_or_create_client_session(&sessions, game_server_addr, remote_addr, local.clone())
-                .await;
-
-        if let Err(e) = upstream.send_to(&buf[..n], remote_addr).await {
-            warn!("Failed to send packet to {}: {}", remote_addr, e);
-        }
-    }
-}
-
-async fn get_or_create_client_session(
-    sessions: &Arc<Mutex<HashMap<SocketAddr, ClientSession>>>,
-    game_server_addr: SocketAddr,
-    remote_addr: SocketAddr,
-    local: Arc<UdpSocket>,
-) -> Arc<UdpSocket> {
-    {
-        let mut map = sessions.lock().unwrap();
-        if let Some(session) = map.get_mut(&game_server_addr) {
-            session.last_active = Instant::now();
-            return session.upstream.clone();
-        }
-    }
-
-    let upstream = new_outbound().await;
-    let response_task =
-        spawn_client_response(upstream.clone(), local, game_server_addr, remote_addr);
-
-    sessions.lock().unwrap().insert(
-        game_server_addr,
-        ClientSession {
-            upstream: upstream.clone(),
-            last_active: Instant::now(),
-            response_task,
-        },
-    );
-
-    info!("New client session for game server {}", game_server_addr);
-    upstream
-}
-
-fn spawn_client_response(
-    upstream: Arc<UdpSocket>,
-    local: Arc<UdpSocket>,
-    game_server_addr: SocketAddr,
-    _remote_addr: SocketAddr,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            match upstream.recv_from(&mut buf).await {
-                Ok((n, _)) => {
-                    if let Err(e) = local.send_to(&buf[..n], game_server_addr).await {
-                        warn!("Failed to send response to {}: {}", game_server_addr, e);
-                    }
-                }
-                Err(e) => warn!("Response receive error: {}", e),
-            }
-        }
-    })
-}
-
-fn cleanup_expired_sessions<T>(sessions: &Arc<Mutex<HashMap<SocketAddr, T>>>)
-where
-    T: HasResponseTask,
-{
+fn cleanup_expired(sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSession>>>) {
     let expired: Vec<SocketAddr> = {
         let map = sessions.lock().unwrap();
         map.iter()
-            .filter(|(_, s)| Instant::now().duration_since(s.last_active()) >= SESSION_TIMEOUT)
+            .filter(|(_, s)| Instant::now().duration_since(s.last_active) >= SESSION_TIMEOUT)
             .map(|(k, _)| *k)
             .collect()
     };
     for key in expired {
         if let Some(s) = sessions.lock().unwrap().remove(&key) {
-            s.abort_task();
+            s.response_task.abort();
         }
-    }
-}
-
-trait HasResponseTask {
-    fn last_active(&self) -> Instant;
-    fn abort_task(self);
-}
-
-impl HasResponseTask for UdpServerSession {
-    fn last_active(&self) -> Instant {
-        self.last_active
-    }
-    fn abort_task(self) {
-        self.response_task.abort();
-    }
-}
-
-impl HasResponseTask for ClientSession {
-    fn last_active(&self) -> Instant {
-        self.last_active
-    }
-    fn abort_task(self) {
-        self.response_task.abort();
     }
 }
 
@@ -417,11 +268,7 @@ fn safe_resolve(addr: &str) -> Option<SocketAddr> {
 
 fn fmt_tunnel_header(tunnel: &Tunnel) -> String {
     let label = match tunnel.protocol {
-        Protocol::Udp => match tunnel.role {
-            Some(Role::Server) => "UDP Server",
-            Some(Role::Client) => "UDP Client",
-            None => "UDP",
-        },
+        Protocol::Udp => "UDP",
         Protocol::Tcp => "TCP",
     };
     format!("[{}] {} -> {}", label, tunnel.listen, tunnel.forward)
@@ -499,24 +346,25 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
             let mut buf = vec![0u8; HEARTBEAT_MAGIC.len()];
             match tokio::time::timeout(Duration::from_secs(2), probe.recv_from(&mut buf)).await {
                 Ok(Ok((n, src))) if n == HEARTBEAT_MAGIC.len() && buf[..n] == *HEARTBEAT_MAGIC => {
-                    println!(
-                        "{}",
-                        ok(format!("heartbeat echo from {src} (ipbridge running)"))
-                    );
+                    println!("{}", ok(format!("heartbeat echo from {src} (ipbridge running)")));
                 }
                 Ok(Ok((n, src))) => {
                     println!(
                         "{}",
-                        warn(format!(
-                            "response from {src} ({n} bytes) not a valid heartbeat"
-                        ))
+                        warn(format!("response from {src} ({n} bytes) not a valid heartbeat"))
                     );
                 }
                 Ok(Err(e)) => {
                     println!("{}", warn(format!("heartbeat receive error: {e}")));
                 }
                 Err(_) => {
-                    println!("{}", warn("no heartbeat response within 2s (ipbridge may not be running on the remote end)".into()));
+                    println!(
+                        "{}",
+                        warn(
+                            "no heartbeat response within 2s (ipbridge may not be running on the remote end)"
+                                .into()
+                        )
+                    );
                 }
             }
         }
@@ -541,9 +389,19 @@ mod tests {
         assert!(addr.is_ipv6());
     }
 
+    #[test]
+    fn test_safe_resolve_valid() {
+        assert!(safe_resolve("127.0.0.1:0").is_some());
+    }
+
+    #[test]
+    fn test_safe_resolve_invalid_port() {
+        assert!(safe_resolve("127.0.0.1:99999").is_none());
+    }
+
     #[tokio::test]
     async fn test_cleanup_expired_removes_stale_sessions() {
-        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
+        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
         let dummy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -554,21 +412,21 @@ mod tests {
         });
         sessions.lock().unwrap().insert(
             addr,
-            UdpServerSession {
+            UdpSession {
                 socket: dummy,
                 last_active: Instant::now() - Duration::from_secs(61),
                 response_task: handle,
             },
         );
 
-        cleanup_expired_sessions(&sessions);
+        cleanup_expired(&sessions);
 
         assert!(sessions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn test_cleanup_expired_keeps_active_sessions() {
-        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpServerSession>>> =
+        let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let addr: SocketAddr = "127.0.0.1:10002".parse().unwrap();
         let dummy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -579,14 +437,14 @@ mod tests {
         });
         sessions.lock().unwrap().insert(
             addr,
-            UdpServerSession {
+            UdpSession {
                 socket: dummy,
                 last_active: Instant::now(),
                 response_task: handle,
             },
         );
 
-        cleanup_expired_sessions(&sessions);
+        cleanup_expired(&sessions);
 
         assert_eq!(sessions.lock().unwrap().len(), 1);
     }
