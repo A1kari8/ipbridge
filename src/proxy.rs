@@ -101,11 +101,7 @@ pub async fn run_udp_tunnel(tunnel: Tunnel) {
     let listen_addr = resolve_addr(&tunnel.listen, "udp listen");
     let target_addr = resolve_addr(&tunnel.forward, "udp target");
 
-    let listener = Arc::new(
-        UdpSocket::bind(listen_addr)
-            .await
-            .expect("UDP bind failed"),
-    );
+    let listener = Arc::new(UdpSocket::bind(listen_addr).await.expect("UDP bind failed"));
     info!("UDP tunnel listening on {} -> {}", listen_addr, target_addr);
 
     let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
@@ -346,12 +342,17 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
             let mut buf = vec![0u8; HEARTBEAT_MAGIC.len()];
             match tokio::time::timeout(Duration::from_secs(2), probe.recv_from(&mut buf)).await {
                 Ok(Ok((n, src))) if n == HEARTBEAT_MAGIC.len() && buf[..n] == *HEARTBEAT_MAGIC => {
-                    println!("{}", ok(format!("heartbeat echo from {src} (ipbridge running)")));
+                    println!(
+                        "{}",
+                        ok(format!("heartbeat echo from {src} (ipbridge running)"))
+                    );
                 }
                 Ok(Ok((n, src))) => {
                     println!(
                         "{}",
-                        warn(format!("response from {src} ({n} bytes) not a valid heartbeat"))
+                        warn(format!(
+                            "response from {src} ({n} bytes) not a valid heartbeat"
+                        ))
                     );
                 }
                 Ok(Err(e)) => {
