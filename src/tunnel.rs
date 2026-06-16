@@ -86,13 +86,13 @@ async fn bind_udp_any() -> std::io::Result<UdpSocket> {
 
 // ===== Top-level =====
 
-pub async fn run_proxy(config: TunnelConfig) {
+pub async fn run(config: TunnelConfig) {
     let mut handles = Vec::new();
 
     for tunnel in config.tunnel.into_iter().filter(|t| t.enable) {
         match tunnel.protocol {
-            Protocol::Udp => handles.push(tokio::spawn(run_udp_tunnel(tunnel))),
-            Protocol::Tcp => handles.push(tokio::spawn(run_tcp_tunnel(tunnel))),
+            Protocol::Udp => handles.push(tokio::spawn(run_udp(tunnel))),
+            Protocol::Tcp => handles.push(tokio::spawn(run_tcp(tunnel))),
         }
     }
 
@@ -110,7 +110,7 @@ struct UdpSession {
     response_task: JoinHandle<()>,
 }
 
-pub async fn run_udp_tunnel(tunnel: Tunnel) {
+pub async fn run_udp(tunnel: Tunnel) {
     let listen_addr = resolve_addr(&tunnel.listen, "udp listen");
     let target_addr = resolve_addr(&tunnel.forward, "udp target");
 
@@ -232,7 +232,7 @@ fn cleanup_expired(sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSession>>>) {
 
 // ===== TCP Tunnel =====
 
-pub async fn run_tcp_tunnel(tunnel: Tunnel) {
+pub async fn run_tcp(tunnel: Tunnel) {
     let forward_addr = resolve_addr(&tunnel.forward, "tcp forward");
 
     let listener = TcpListener::bind(&tunnel.listen)
@@ -293,7 +293,7 @@ fn fmt_tunnel_header(tunnel: &Tunnel) -> String {
     format!("[{}] {} -> {}", label, tunnel.listen, tunnel.forward)
 }
 
-pub async fn check_tunnel(tunnel: &Tunnel) {
+pub async fn check(tunnel: &Tunnel) {
     let ok = |s: String| format!("  \x1b[32m[ok]\x1b[0m {s}");
     let fail = |s: String| format!("  \x1b[31m[fail]\x1b[0m {s}");
     let warn = |s: String| format!("  \x1b[33m[warn]\x1b[0m {s}");

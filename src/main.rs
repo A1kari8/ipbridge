@@ -1,11 +1,11 @@
 mod cli;
 mod config;
-mod proxy;
+mod tunnel;
 
 use clap::Parser;
 use cli::{Cli, Command};
 use config::TunnelConfig;
-use proxy::run_proxy;
+use tunnel::run;
 
 fn exit(msg: &str) -> ! {
     eprintln!("Error: {}", msg);
@@ -36,7 +36,7 @@ async fn main() {
         Some(Command::Check) => {
             let config = TunnelConfig::load(&config_path).unwrap_or_else(|e| exit(&e.to_string()));
             for tunnel in &config.tunnel {
-                proxy::check_tunnel(tunnel).await;
+                tunnel::check(tunnel).await;
                 println!();
             }
         }
@@ -48,7 +48,7 @@ async fn main() {
                 std::process::exit(0);
             });
 
-            run_proxy(config).await;
+            run(config).await;
         }
     }
 }
