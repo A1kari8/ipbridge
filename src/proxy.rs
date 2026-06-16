@@ -13,8 +13,20 @@ use tokio::time::{Duration, Instant};
 const BUF_SIZE: usize = 65_535;
 const TCP_SND_BUF: usize = 256 * 1024;
 const TCP_RCV_BUF: usize = 256 * 1024;
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+const MIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_TIMEOUT: Duration = Duration::from_secs(180);
 const HEARTBEAT_MAGIC: &[u8] = b"IPBR";
+
+fn session_timeout(max_gap: Duration) -> Duration {
+    let t = max_gap * 3;
+    if t > MAX_TIMEOUT {
+        MAX_TIMEOUT
+    } else if t < Duration::from_secs(30) {
+        Duration::from_secs(30)
+    } else {
+        t
+    }
+}
 
 // ===== Utility =====
 
@@ -94,6 +106,7 @@ pub async fn run_proxy(config: TunnelConfig) {
 struct UdpSession {
     socket: Arc<UdpSocket>,
     last_active: Instant,
+    max_gap: Duration,
     response_task: JoinHandle<()>,
 }
 
@@ -110,7 +123,7 @@ pub async fn run_udp_tunnel(tunnel: Tunnel) {
     let cleanup = sessions.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(SESSION_TIMEOUT).await;
+            tokio::time::sleep(MAX_TIMEOUT / 2).await;
             cleanup_expired(&cleanup);
         }
     });
@@ -151,7 +164,12 @@ async fn get_or_create_session(
     {
         let mut map = sessions.lock().unwrap();
         if let Some(session) = map.get_mut(&src_addr) {
-            session.last_active = Instant::now();
+            let now = Instant::now();
+            let gap = now - session.last_active;
+            if gap > session.max_gap {
+                session.max_gap = gap;
+            }
+            session.last_active = now;
             return session.socket.clone();
         }
     }
@@ -164,6 +182,7 @@ async fn get_or_create_session(
         UdpSession {
             socket: socket.clone(),
             last_active: Instant::now(),
+            max_gap: MIN_TIMEOUT,
             response_task,
         },
     );
@@ -193,10 +212,14 @@ fn spawn_session_response(
 }
 
 fn cleanup_expired(sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSession>>>) {
+    let now = Instant::now();
     let expired: Vec<SocketAddr> = {
         let map = sessions.lock().unwrap();
         map.iter()
-            .filter(|(_, s)| Instant::now().duration_since(s.last_active) >= SESSION_TIMEOUT)
+            .filter(|(_, s)| {
+                let timeout = session_timeout(s.max_gap);
+                now.duration_since(s.last_active) >= timeout
+            })
             .map(|(k, _)| *k)
             .collect()
     };
@@ -416,6 +439,7 @@ mod tests {
             UdpSession {
                 socket: dummy,
                 last_active: Instant::now() - Duration::from_secs(61),
+                max_gap: Duration::from_secs(10),
                 response_task: handle,
             },
         );
@@ -441,6 +465,7 @@ mod tests {
             UdpSession {
                 socket: dummy,
                 last_active: Instant::now(),
+                max_gap: Duration::from_secs(10),
                 response_task: handle,
             },
         );
