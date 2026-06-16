@@ -385,7 +385,7 @@ pub async fn check_tunnel(tunnel: &Tunnel) {
                     println!(
                         "{}",
                         warn(
-                            "no heartbeat response within 2s (ipbridge may not be running on the remote end)"
+                            "heartbeat: no response within 2s (this is normal if forward is not another ipbridge)"
                                 .into()
                         )
                     );
