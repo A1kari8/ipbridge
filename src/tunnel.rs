@@ -109,7 +109,25 @@ pub async fn run_udp(tunnel: Tunnel) {
     let listen_addr = resolve_addr(&tunnel.listen, "udp listen");
     let target_addr = resolve_addr(&tunnel.forward, "udp target");
 
-    let listener = Arc::new(UdpSocket::bind(listen_addr).await.expect("UDP bind failed"));
+    let sock2 = socket2::Socket::new(
+        if listen_addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        },
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .expect("Failed to create UDP socket");
+    if listen_addr.is_ipv6() {
+        sock2.set_only_v6(true).expect("Failed to set IPV6_V6ONLY");
+    }
+    sock2
+        .set_nonblocking(true)
+        .expect("Failed to set nonblocking");
+    sock2.bind(&listen_addr.into()).expect("UDP bind failed");
+    let listener =
+        Arc::new(UdpSocket::from_std(sock2.into()).expect("Failed to create tokio socket"));
     info!("UDP tunnel listening on {} -> {}", listen_addr, target_addr);
 
     let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =

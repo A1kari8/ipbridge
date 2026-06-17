@@ -182,13 +182,14 @@ dependencies = [
 
 [[package]]
 name = "ipbridge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
  "env_logger",
  "log",
  "serde",
+ "socket2",
  "tokio",
  "toml",
 ]
