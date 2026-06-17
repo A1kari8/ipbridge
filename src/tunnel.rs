@@ -13,28 +13,23 @@ use tokio::time::{Duration, Instant};
 const BUF_SIZE: usize = 65_535;
 const TCP_SND_BUF: usize = 256 * 1024;
 const TCP_RCV_BUF: usize = 256 * 1024;
-const MIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TIMEOUT: Duration = Duration::from_secs(180);
 const HEARTBEAT_MAGIC: &[u8] = b"IPBR";
 
 fn session_timeout(max_gap: Duration) -> Duration {
-    let t = max_gap * 3;
-    if t > MAX_TIMEOUT {
-        MAX_TIMEOUT
-    } else if t < Duration::from_secs(30) {
-        Duration::from_secs(30)
-    } else {
-        t
-    }
+    (max_gap * 3).clamp(MIN_TIMEOUT, MAX_TIMEOUT)
 }
 
 // ===== Utility =====
 
 fn resolve_addr(addr: &str, label: &str) -> SocketAddr {
-    addr.to_socket_addrs()
-        .ok()
-        .and_then(|mut iter| iter.next())
-        .unwrap_or_else(|| panic!("Failed to resolve {} address: {}", label, addr))
+    let mut addrs = addr
+        .to_socket_addrs()
+        .unwrap_or_else(|e| panic!("Failed to resolve {} address '{}': {}", label, addr, e));
+    addrs
+        .next()
+        .unwrap_or_else(|| panic!("No addresses found for {} '{}'", label, addr))
 }
 
 fn new_tcp_socket(addr: SocketAddr) -> Result<TcpSocket, tokio::io::Error> {
