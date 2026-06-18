@@ -21,6 +21,7 @@ async fn main() {
         Some(Command::Check) => {}
         _ => {
             env_logger::Builder::from_default_env()
+                .format_target(false)
                 .filter_level(log::LevelFilter::Info)
                 .init();
         }
