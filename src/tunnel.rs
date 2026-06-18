@@ -298,6 +298,17 @@ fn safe_resolve(addr: &str) -> Option<SocketAddr> {
     addr.to_socket_addrs().ok().and_then(|mut iter| iter.next())
 }
 
+fn is_domain_addr(addr: &str) -> bool {
+    let host = if addr.starts_with('[') {
+        let end = addr.find(']').unwrap_or(0);
+        &addr[1..end]
+    } else {
+        let colon = addr.rfind(':').unwrap_or(0);
+        &addr[..colon]
+    };
+    host.parse::<std::net::IpAddr>().is_err()
+}
+
 fn fmt_tunnel_header(tunnel: &Tunnel) -> String {
     let label = match tunnel.protocol {
         Protocol::Udp => "UDP",
@@ -315,7 +326,12 @@ pub async fn check(tunnel: &Tunnel) {
 
     let listen_addr = match safe_resolve(&tunnel.listen) {
         Some(a) => {
-            println!("{}", ok(format!("listen resolves to {a}")));
+            let note = if is_domain_addr(&tunnel.listen) {
+                format!("listen \"{}\" resolves to {}", tunnel.listen, a)
+            } else {
+                format!("listen resolves to {a}")
+            };
+            println!("{}", ok(note));
             a
         }
         None => {
@@ -326,7 +342,12 @@ pub async fn check(tunnel: &Tunnel) {
 
     let target_addr = match safe_resolve(&tunnel.forward) {
         Some(a) => {
-            println!("{}", ok(format!("forward resolves to {a}")));
+            let note = if is_domain_addr(&tunnel.forward) {
+                format!("forward \"{}\" resolves to {}", tunnel.forward, a)
+            } else {
+                format!("forward resolves to {a}")
+            };
+            println!("{}", ok(note));
             a
         }
         None => {
@@ -486,5 +507,25 @@ mod tests {
         cleanup_expired(&sessions);
 
         assert_eq!(sessions.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn is_domain_addr_returns_false_for_ipv4() {
+        assert!(!is_domain_addr("127.0.0.1:7777"));
+    }
+
+    #[test]
+    fn is_domain_addr_returns_false_for_ipv6() {
+        assert!(!is_domain_addr("[::1]:7777"));
+    }
+
+    #[test]
+    fn is_domain_addr_returns_true_for_hostname() {
+        assert!(is_domain_addr("example.com:7777"));
+    }
+
+    #[test]
+    fn is_domain_addr_returns_false_for_ipv4_port_range() {
+        assert!(!is_domain_addr("0.0.0.0:9000-9005"));
     }
 }

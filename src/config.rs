@@ -152,6 +152,10 @@ impl TunnelConfig {
         })?;
         let mut config: TunnelConfig = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file {}", path.display()))?;
+        for t in &mut config.tunnel {
+            t.listen = t.listen.trim().to_string();
+            t.forward = t.forward.trim().to_string();
+        }
         expand_port_ranges(&mut config)?;
         Ok(config)
     }
@@ -254,5 +258,26 @@ mod tests {
             }],
         };
         assert!(expand_port_ranges(&mut config).is_err());
+    }
+
+    #[test]
+    fn test_addr_trim_in_load() {
+        let dir = std::env::temp_dir().join("ipbridge_test_trim");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[[tunnel]]
+protocol = "udp"
+listen = "  0.0.0.0:7777  "
+forward = "  127.0.0.1:8888   "
+enable = true
+"#,
+        )
+        .unwrap();
+        let config = TunnelConfig::load(&path).unwrap();
+        assert_eq!(config.tunnel[0].listen, "0.0.0.0:7777");
+        assert_eq!(config.tunnel[0].forward, "127.0.0.1:8888");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
