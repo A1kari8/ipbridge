@@ -1,5 +1,6 @@
+use crate::compress::{Codec, Compression};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{fs, path::Path};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -14,6 +15,8 @@ pub struct Tunnel {
     pub forward: String,
     #[serde(default = "default_enable_true")]
     pub enable: bool,
+    #[serde(default, deserialize_with = "de_compress")]
+    pub compress: Option<Compression>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +30,47 @@ fn default_enable_true() -> bool {
     true
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CompressRaw {
+    Flag(bool),
+    Str(String),
+}
+
+fn de_compress<'de, D>(deserializer: D) -> Result<Option<Compression>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    match Option::<CompressRaw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(CompressRaw::Flag(false)) => Ok(None),
+        Some(CompressRaw::Flag(true)) => Err(D::Error::custom(
+            "compress = true is not supported; use compress = \"zlib\" or compress = \"zstd:3\"",
+        )),
+        Some(CompressRaw::Str(s)) => parse_compress(&s).map(Some).map_err(D::Error::custom),
+    }
+}
+
+fn parse_compress(s: &str) -> Result<Compression> {
+    let (name, level) = match s.split_once(':') {
+        Some((n, l)) => (n, Some(l)),
+        None => (s, None),
+    };
+    let codec = Codec::from_name(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown compression algorithm '{}'", name))?;
+    let level = match level {
+        Some(l) => Some(
+            l.parse::<i32>()
+                .map_err(|_| anyhow::anyhow!("invalid compression level '{}'", l))?,
+        ),
+        None => None,
+    };
+    let compression = Compression::new(codec, level);
+    compression.validate().map_err(anyhow::Error::msg)?;
+    Ok(compression)
+}
+
 const TEMPLATE: &str = r#"# 配置模板 (TOML)
 
 # UDP 隧道
@@ -35,6 +79,9 @@ protocol = "udp"
 listen = "[::]:7777"
 forward = "127.0.0.1:8888"
 enable = true
+# 压缩链路数据（两端需同时开启；链路另一端必须是另一台 ipbridge）
+# compress = "zlib"    # 可选: zlib | gz | zstd（默认等级）
+# compress = "zstd:3"  # 可指定等级: zlib/gz 1-9, zstd 1-22
 
 # TCP 隧道
 # [[tunnel]]
@@ -42,6 +89,7 @@ enable = true
 # listen = "0.0.0.0:9000"
 # forward = "10.0.0.5:9000"
 # enable = true
+# compress = "zstd"
 
 # 端口范围映射（显式）
 # [[tunnel]]
@@ -261,6 +309,7 @@ fn expand_port_ranges(config: &mut TunnelConfig) -> Result<()> {
                 forward: format!("{}:{}", forward_base, f_start + i),
                 protocol: tunnel.protocol.clone(),
                 enable: tunnel.enable,
+                compress: tunnel.compress,
             });
         }
     }
@@ -386,6 +435,7 @@ mod tests {
                 listen: "[::]:7777-7779".into(),
                 forward: "127.0.0.1:10000-*".into(),
                 enable: true,
+                compress: None,
             }],
         };
         expand_port_ranges(&mut config).unwrap();
@@ -406,6 +456,7 @@ mod tests {
                 listen: "[::]:7777-7780".into(),
                 forward: "127.0.0.1:*-10003".into(),
                 enable: true,
+                compress: None,
             }],
         };
         expand_port_ranges(&mut config).unwrap();
@@ -422,6 +473,7 @@ mod tests {
                 listen: "[::]:7777-7779".into(),
                 forward: "127.0.0.1:*".into(),
                 enable: true,
+                compress: None,
             }],
         };
         expand_port_ranges(&mut config).unwrap();
@@ -439,6 +491,7 @@ mod tests {
                 listen: "[::]:*-7780".into(),
                 forward: "127.0.0.1:10000-10003".into(),
                 enable: true,
+                compress: None,
             }],
         };
         expand_port_ranges(&mut config).unwrap();
@@ -455,6 +508,7 @@ mod tests {
                 listen: "[::]:*".into(),
                 forward: "127.0.0.1:10000-10002".into(),
                 enable: true,
+                compress: None,
             }],
         };
         expand_port_ranges(&mut config).unwrap();
@@ -472,6 +526,7 @@ mod tests {
                 listen: "[::]:*".into(),
                 forward: "127.0.0.1:*".into(),
                 enable: true,
+                compress: None,
             }],
         };
         assert!(expand_port_ranges(&mut config).is_err());
@@ -485,6 +540,7 @@ mod tests {
                 listen: "[::]:7777-7779".into(),
                 forward: "127.0.0.1:8888".into(),
                 enable: true,
+                compress: None,
             }],
         };
         assert!(expand_port_ranges(&mut config).is_err());
@@ -498,6 +554,7 @@ mod tests {
                 listen: "[::]:7777-7779".into(),
                 forward: "127.0.0.1:8888-8890".into(),
                 enable: true,
+                compress: None,
             }],
         };
         expand_port_ranges(&mut config).unwrap();
@@ -518,6 +575,7 @@ mod tests {
                 listen: "0.0.0.0:9000".into(),
                 forward: "10.0.0.5:9000".into(),
                 enable: true,
+                compress: None,
             }],
         };
         expand_port_ranges(&mut config).unwrap();
@@ -533,6 +591,7 @@ mod tests {
                 listen: "[::]:7777-7779".into(),
                 forward: "127.0.0.1:8888".into(),
                 enable: true,
+                compress: None,
             }],
         };
         assert!(expand_port_ranges(&mut config).is_err());
@@ -556,6 +615,87 @@ enable = true
         let config = TunnelConfig::load(&path).unwrap();
         assert_eq!(config.tunnel[0].listen, "0.0.0.0:7777");
         assert_eq!(config.tunnel[0].forward, "127.0.0.1:8888");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compress_defaults_in_load() {
+        let dir = std::env::temp_dir().join("ipbridge_test_compress");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[[tunnel]]
+protocol = "udp"
+listen = "0.0.0.0:7777"
+forward = "127.0.0.1:8888"
+
+[[tunnel]]
+protocol = "tcp"
+listen = "0.0.0.0:9000"
+forward = "10.0.0.5:9000"
+compress = "zstd:3"
+"#,
+        )
+        .unwrap();
+        let config = TunnelConfig::load(&path).unwrap();
+        assert_eq!(config.tunnel[0].compress, None);
+        assert_eq!(
+            config.tunnel[1].compress,
+            Some(Compression::new(Codec::Zstd, Some(3)))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compress_parsing() {
+        let parse = |s: &str| parse_compress(s);
+
+        assert_eq!(parse("zlib").unwrap(), Compression::new(Codec::Zlib, None));
+        assert_eq!(parse("gz:9").unwrap(), Compression::new(Codec::Gz, Some(9)));
+        assert_eq!(parse("zstd").unwrap(), Compression::new(Codec::Zstd, None));
+        assert!(parse("lz4").is_err());
+        assert!(parse("zlib:10").is_err());
+        assert!(parse("zstd:23").is_err());
+        assert!(parse("zstd:abc").is_err());
+    }
+
+    #[test]
+    fn test_compress_true_is_rejected() {
+        let dir = std::env::temp_dir().join("ipbridge_test_compress_true");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[[tunnel]]
+protocol = "udp"
+listen = "0.0.0.0:7777"
+forward = "127.0.0.1:8888"
+compress = true
+"#,
+        )
+        .unwrap();
+        assert!(TunnelConfig::load(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compress_false_is_none() {
+        let dir = std::env::temp_dir().join("ipbridge_test_compress_false");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[[tunnel]]
+protocol = "udp"
+listen = "0.0.0.0:7777"
+forward = "127.0.0.1:8888"
+compress = false
+"#,
+        )
+        .unwrap();
+        let config = TunnelConfig::load(&path).unwrap();
+        assert_eq!(config.tunnel[0].compress, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

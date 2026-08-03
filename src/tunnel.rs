@@ -1,3 +1,4 @@
+use crate::compress::{self, Compression};
 use crate::config::{Protocol, Tunnel, TunnelConfig};
 use log::{error, info, warn};
 use std::collections::HashMap;
@@ -19,6 +20,38 @@ const HEARTBEAT_MAGIC: &[u8] = b"IPBR";
 
 fn session_timeout(max_gap: Duration) -> Duration {
     (max_gap * 3).clamp(MIN_TIMEOUT, MAX_TIMEOUT)
+}
+
+#[derive(Default)]
+struct ByteStats {
+    payload: u64,
+    wire: u64,
+}
+
+impl ByteStats {
+    fn add(&mut self, payload: u64, wire: u64) {
+        self.payload += payload;
+        self.wire += wire;
+    }
+}
+
+fn fmt_compress_effect(payload: u64, wire: u64) -> String {
+    if payload == 0 {
+        return String::new();
+    }
+    let diff = (payload as f64 - wire as f64) / payload as f64 * 100.0;
+    if diff >= 0.0 {
+        format!("{:.1}% saved", diff)
+    } else {
+        format!("{:.1}% overhead", -diff)
+    }
+}
+
+fn fmt_compress(c: Option<Compression>) -> String {
+    match c {
+        Some(c) => format!("compress {}:{}", c.codec.name(), c.level),
+        None => "no compression".into(),
+    }
 }
 
 // ===== Utility =====
@@ -103,6 +136,7 @@ struct UdpSession {
     last_active: Instant,
     max_gap: Duration,
     response_task: JoinHandle<()>,
+    stats: Arc<Mutex<ByteStats>>,
 }
 
 pub async fn run_udp(tunnel: Tunnel) {
@@ -128,7 +162,12 @@ pub async fn run_udp(tunnel: Tunnel) {
     sock2.bind(&listen_addr.into()).expect("UDP bind failed");
     let listener =
         Arc::new(UdpSocket::from_std(sock2.into()).expect("Failed to create tokio socket"));
-    info!("UDP tunnel listening on {} -> {}", listen_addr, target_addr);
+    info!(
+        "UDP tunnel listening on {} -> {} ({})",
+        listen_addr,
+        target_addr,
+        fmt_compress(tunnel.compress)
+    );
 
     let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -138,10 +177,13 @@ pub async fn run_udp(tunnel: Tunnel) {
         loop {
             tokio::time::sleep(MAX_TIMEOUT / 2).await;
             cleanup_expired(&cleanup);
+            log_udp_summary(&cleanup);
         }
     });
 
     let mut buf = vec![0u8; BUF_SIZE];
+    let mut pbuf = vec![0u8; BUF_SIZE];
+    let mut cbuf = Vec::new();
 
     loop {
         let (n, src_addr) = match listener.recv_from(&mut buf).await {
@@ -159,9 +201,32 @@ pub async fn run_udp(tunnel: Tunnel) {
             continue;
         }
 
-        let session = get_or_create_session(&sessions, src_addr, listener.clone()).await;
+        let compress = tunnel.compress;
+        let (packet, link) = match compress::decompress(&buf[..n], &mut pbuf) {
+            Some(len) => (&pbuf[..len], true),
+            None => (&buf[..n], false),
+        };
 
-        if let Err(e) = session.send_to(&buf[..n], target_addr).await {
+        let (session, stats) =
+            get_or_create_session(&sessions, src_addr, listener.clone(), link, compress).await;
+
+        if let Some(c) = compress {
+            if link {
+                stats.lock().unwrap().add(packet.len() as u64, n as u64);
+            }
+            if !link {
+                compress::compress_frame(c, packet, &mut cbuf);
+                stats
+                    .lock()
+                    .unwrap()
+                    .add(packet.len() as u64, cbuf.len() as u64);
+                if let Err(e) = session.send_to(&cbuf, target_addr).await {
+                    warn!("Failed to send packet to {}: {}", target_addr, e);
+                }
+            } else if let Err(e) = session.send_to(packet, target_addr).await {
+                warn!("Failed to send packet to {}: {}", target_addr, e);
+            }
+        } else if let Err(e) = session.send_to(packet, target_addr).await {
             warn!("Failed to send packet to {}: {}", target_addr, e);
         }
     }
@@ -171,7 +236,9 @@ async fn get_or_create_session(
     sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSession>>>,
     src_addr: SocketAddr,
     listener: Arc<UdpSocket>,
-) -> Arc<UdpSocket> {
+    link: bool,
+    compress: Option<Compression>,
+) -> (Arc<UdpSocket>, Arc<Mutex<ByteStats>>) {
     cleanup_expired(sessions);
 
     {
@@ -183,12 +250,20 @@ async fn get_or_create_session(
                 session.max_gap = gap;
             }
             session.last_active = now;
-            return session.socket.clone();
+            return (session.socket.clone(), session.stats.clone());
         }
     }
 
     let socket = new_outbound().await;
-    let response_task = spawn_session_response(socket.clone(), listener, src_addr);
+    let stats = Arc::new(Mutex::new(ByteStats::default()));
+    let response_task = spawn_session_response(
+        socket.clone(),
+        listener,
+        src_addr,
+        compress,
+        link,
+        stats.clone(),
+    );
 
     sessions.lock().unwrap().insert(
         src_addr,
@@ -197,24 +272,50 @@ async fn get_or_create_session(
             last_active: Instant::now(),
             max_gap: MIN_TIMEOUT,
             response_task,
+            stats: stats.clone(),
         },
     );
 
     info!("New UDP session for peer {}", src_addr);
-    socket
+    (socket, stats)
 }
 
 fn spawn_session_response(
     session_socket: Arc<UdpSocket>,
     listener: Arc<UdpSocket>,
     peer_addr: SocketAddr,
+    compress: Option<Compression>,
+    link: bool,
+    stats: Arc<Mutex<ByteStats>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; BUF_SIZE];
+        let mut pbuf = vec![0u8; BUF_SIZE];
+        let mut cbuf = Vec::new();
         loop {
             match session_socket.recv_from(&mut buf).await {
                 Ok((n, _)) => {
-                    if let Err(e) = listener.send_to(&buf[..n], peer_addr).await {
+                    let packet = match compress::decompress(&buf[..n], &mut pbuf) {
+                        Some(len) => {
+                            stats.lock().unwrap().add(len as u64, n as u64);
+                            &pbuf[..len]
+                        }
+                        None => &buf[..n],
+                    };
+                    if let Some(c) = compress {
+                        if link {
+                            compress::compress_frame(c, packet, &mut cbuf);
+                            stats
+                                .lock()
+                                .unwrap()
+                                .add(packet.len() as u64, cbuf.len() as u64);
+                            if let Err(e) = listener.send_to(&cbuf, peer_addr).await {
+                                warn!("Failed to send response to {}: {}", peer_addr, e);
+                            }
+                        } else if let Err(e) = listener.send_to(packet, peer_addr).await {
+                            warn!("Failed to send response to {}: {}", peer_addr, e);
+                        }
+                    } else if let Err(e) = listener.send_to(packet, peer_addr).await {
                         warn!("Failed to send response to {}: {}", peer_addr, e);
                     }
                 }
@@ -239,7 +340,35 @@ fn cleanup_expired(sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSession>>>) {
     for key in expired {
         if let Some(s) = sessions.lock().unwrap().remove(&key) {
             s.response_task.abort();
+            let st = s.stats.lock().unwrap();
+            if st.payload > 0 {
+                info!(
+                    "UDP session {} closed: {} -> {} bytes ({})",
+                    key,
+                    st.payload,
+                    st.wire,
+                    fmt_compress_effect(st.payload, st.wire)
+                );
+            }
         }
+    }
+}
+
+fn log_udp_summary(sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSession>>>) {
+    let (payload, wire) = {
+        let map = sessions.lock().unwrap();
+        map.values().fold((0u64, 0u64), |(p, w), s| {
+            let st = s.stats.lock().unwrap();
+            (p + st.payload, w + st.wire)
+        })
+    };
+    if payload > 0 {
+        info!(
+            "UDP compression summary: {} -> {} bytes ({})",
+            payload,
+            wire,
+            fmt_compress_effect(payload, wire)
+        );
     }
 }
 
@@ -252,8 +381,10 @@ pub async fn run_tcp(tunnel: Tunnel) {
         .await
         .expect("TCP bind failed");
     info!(
-        "TCP tunnel listening on {} -> {}",
-        tunnel.listen, tunnel.forward
+        "TCP tunnel listening on {} -> {} ({})",
+        tunnel.listen,
+        tunnel.forward,
+        fmt_compress(tunnel.compress)
     );
 
     loop {
@@ -265,7 +396,12 @@ pub async fn run_tcp(tunnel: Tunnel) {
             }
         };
 
-        tokio::spawn(handle_tcp_connection(inbound, src, forward_addr));
+        tokio::spawn(handle_tcp_connection(
+            inbound,
+            src,
+            forward_addr,
+            tunnel.compress,
+        ));
     }
 }
 
@@ -273,6 +409,7 @@ async fn handle_tcp_connection(
     mut inbound: tokio::net::TcpStream,
     src: SocketAddr,
     forward_addr: SocketAddr,
+    compress: Option<Compression>,
 ) {
     let _ = inbound.set_nodelay(true);
 
@@ -283,12 +420,153 @@ async fn handle_tcp_connection(
 
     info!("TCP connection {} <-> {} established", src, forward_addr);
 
-    match copy_bidirectional(&mut inbound, &mut outbound).await {
-        Ok((c2s, s2c)) => info!(
-            "TCP closed: {} <-> {} ({}b ->, {}b <-)",
-            src, forward_addr, c2s, s2c,
-        ),
-        Err(e) => warn!("TCP forwarding error {} <-> {}: {}", src, forward_addr, e),
+    if let Some(c) = compress {
+        let (in_r, in_w) = tokio::io::split(inbound);
+        let (out_r, out_w) = tokio::io::split(outbound);
+        let stats = Arc::new(Mutex::new(ByteStats::default()));
+        let a = tokio::spawn(pump(in_r, out_w, c, stats.clone()));
+        let b = tokio::spawn(pump(out_r, in_w, c, stats.clone()));
+        let _ = tokio::join!(a, b);
+        let st = stats.lock().unwrap();
+        if st.payload > 0 {
+            info!(
+                "TCP closed: {} <-> {} compressed {} -> {} bytes ({})",
+                src,
+                forward_addr,
+                st.payload,
+                st.wire,
+                fmt_compress_effect(st.payload, st.wire)
+            );
+        }
+    } else {
+        match copy_bidirectional(&mut inbound, &mut outbound).await {
+            Ok((c2s, s2c)) => info!(
+                "TCP closed: {} <-> {} ({}b ->, {}b <-)",
+                src, forward_addr, c2s, s2c,
+            ),
+            Err(e) => warn!("TCP forwarding error {} <-> {}: {}", src, forward_addr, e),
+        }
+    }
+}
+
+async fn pump<R, W>(
+    mut reader: R,
+    mut writer: W,
+    compression: Compression,
+    stats: Arc<Mutex<ByteStats>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut head = [0u8; 4];
+    let mut filled = 0;
+    while filled < 4 {
+        match reader.read(&mut head[filled..]).await {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => break,
+        }
+    }
+    if filled == 4 && &head == compress::MAGIC {
+        pump_framed(&mut reader, &mut writer, head, &stats).await;
+    } else {
+        pump_plain(
+            &mut reader,
+            &mut writer,
+            &head[..filled],
+            compression,
+            &stats,
+        )
+        .await;
+    }
+    let _ = writer.shutdown().await;
+}
+
+async fn pump_framed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    mut head: [u8; 4],
+    stats: &Arc<Mutex<ByteStats>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut pbuf = vec![0u8; BUF_SIZE];
+    loop {
+        let mut header = [0u8; 6];
+        if reader.read_exact(&mut header).await.is_err() {
+            return;
+        }
+        let orig_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let pay_len = u16::from_le_bytes([header[4], header[5]]) as usize;
+        if orig_len > BUF_SIZE || pay_len > BUF_SIZE + compress::HEADER_LEN {
+            return;
+        }
+        let mut payload = vec![0u8; pay_len];
+        if reader.read_exact(&mut payload).await.is_err() {
+            return;
+        }
+        let mut block = Vec::with_capacity(compress::HEADER_LEN + pay_len);
+        block.extend_from_slice(&head);
+        block.extend_from_slice(&header);
+        block.extend_from_slice(&payload);
+        match compress::decompress(&block, &mut pbuf) {
+            Some(len) => {
+                stats.lock().unwrap().add(len as u64, block.len() as u64);
+                if writer.write_all(&pbuf[..len]).await.is_err() {
+                    return;
+                }
+            }
+            None => return,
+        }
+        if reader.read_exact(&mut head).await.is_err() || &head != compress::MAGIC {
+            return;
+        }
+    }
+}
+
+async fn pump_plain<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    pending: &[u8],
+    compression: Compression,
+    stats: &Arc<Mutex<ByteStats>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut cbuf = Vec::new();
+
+    if !pending.is_empty() {
+        compress::compress_frame(compression, pending, &mut cbuf);
+        stats
+            .lock()
+            .unwrap()
+            .add(pending.len() as u64, cbuf.len() as u64);
+        if writer.write_all(&cbuf).await.is_err() {
+            return;
+        }
+    }
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        compress::compress_frame(compression, &buf[..n], &mut cbuf);
+        stats.lock().unwrap().add(n as u64, cbuf.len() as u64);
+        if writer.write_all(&cbuf).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -434,6 +712,7 @@ pub async fn check(tunnel: &Tunnel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::Codec;
 
     #[tokio::test]
     async fn resolve_addr_ipv4() {
@@ -475,6 +754,7 @@ mod tests {
                 last_active: Instant::now() - Duration::from_secs(61),
                 max_gap: Duration::from_secs(10),
                 response_task: handle,
+                stats: Arc::new(Mutex::new(ByteStats::default())),
             },
         );
 
@@ -501,6 +781,7 @@ mod tests {
                 last_active: Instant::now(),
                 max_gap: Duration::from_secs(10),
                 response_task: handle,
+                stats: Arc::new(Mutex::new(ByteStats::default())),
             },
         );
 
@@ -527,5 +808,227 @@ mod tests {
     #[test]
     fn is_domain_addr_returns_false_for_ipv4_port_range() {
         assert!(!is_domain_addr("0.0.0.0:9000-9005"));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_pump_framing_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let plain: Vec<u8> = (0..50_000u32)
+            .flat_map(|i| format!("{:04x}", i % 4096).into_bytes())
+            .collect();
+
+        let (mut src_w, src_r) = tokio::io::duplex(1 << 20);
+        let (dst_w, mut dst_r) = tokio::io::duplex(1 << 20);
+        let stats = Arc::new(Mutex::new(ByteStats::default()));
+        let stats_e = stats.clone();
+        let encoder = tokio::spawn(async move {
+            pump(src_r, dst_w, Compression::default(), stats_e).await;
+        });
+        src_w.write_all(&plain).await.unwrap();
+        drop(src_w);
+        encoder.await.unwrap();
+
+        let mut framed = Vec::new();
+        dst_r.read_to_end(&mut framed).await.unwrap();
+        assert!(
+            framed.len() < plain.len(),
+            "compression should shrink traffic"
+        );
+
+        let (mut in_w, in_r) = tokio::io::duplex(1 << 20);
+        let (out_w, mut out_r) = tokio::io::duplex(1 << 20);
+        let decoder = tokio::spawn(async move {
+            pump(in_r, out_w, Compression::default(), stats).await;
+        });
+        in_w.write_all(&framed).await.unwrap();
+        drop(in_w);
+        decoder.await.unwrap();
+
+        let mut decoded = Vec::new();
+        out_r.read_to_end(&mut decoded).await.unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_udp_compressed_tunnel_roundtrip() {
+        let server_port: u16 = 24010;
+        let client_port: u16 = 24011;
+        let service_port: u16 = 24012;
+
+        let server = Tunnel {
+            protocol: Protocol::Udp,
+            listen: format!("[::1]:{server_port}"),
+            forward: format!("[::1]:{service_port}"),
+            enable: true,
+            compress: Some(Compression::new(Codec::Zlib, Some(9))),
+        };
+        let client = Tunnel {
+            protocol: Protocol::Udp,
+            listen: format!("[::1]:{client_port}"),
+            forward: format!("[::1]:{server_port}"),
+            enable: true,
+            compress: Some(Compression::new(Codec::Zstd, None)),
+        };
+
+        let service = Arc::new(
+            UdpSocket::bind(format!("[::1]:{service_port}"))
+                .await
+                .unwrap(),
+        );
+        let service_echo = service.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; BUF_SIZE];
+            loop {
+                let Ok((n, from)) = service_echo.recv_from(&mut buf).await else {
+                    return;
+                };
+                let _ = service_echo.send_to(&buf[..n], from).await;
+            }
+        });
+
+        tokio::spawn(run_udp(server));
+        tokio::spawn(run_udp(client));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let app = UdpSocket::bind("[::1]:0").await.unwrap();
+        app.connect(format!("[::1]:{client_port}")).await.unwrap();
+
+        let payload: Vec<u8> = (0..4096u32)
+            .flat_map(|i| format!("{:04x}", i % 4096).into_bytes())
+            .collect();
+
+        app.send(&payload).await.unwrap();
+        let mut buf = vec![0u8; BUF_SIZE];
+        let resp = tokio::time::timeout(Duration::from_secs(3), app.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.0, payload.len());
+        assert_eq!(&buf[..resp.0], &payload[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_udp_client_only_compression_roundtrip() {
+        let server_port: u16 = 24030;
+        let client_port: u16 = 24031;
+        let service_port: u16 = 24032;
+
+        let server = Tunnel {
+            protocol: Protocol::Udp,
+            listen: format!("[::1]:{server_port}"),
+            forward: format!("[::1]:{service_port}"),
+            enable: true,
+            compress: None,
+        };
+        let client = Tunnel {
+            protocol: Protocol::Udp,
+            listen: format!("[::1]:{client_port}"),
+            forward: format!("[::1]:{server_port}"),
+            enable: true,
+            compress: Some(Compression::new(Codec::Zstd, None)),
+        };
+
+        let service = Arc::new(
+            UdpSocket::bind(format!("[::1]:{service_port}"))
+                .await
+                .unwrap(),
+        );
+        let service_echo = service.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; BUF_SIZE];
+            loop {
+                let Ok((n, from)) = service_echo.recv_from(&mut buf).await else {
+                    return;
+                };
+                let _ = service_echo.send_to(&buf[..n], from).await;
+            }
+        });
+
+        tokio::spawn(run_udp(server));
+        tokio::spawn(run_udp(client));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let app = UdpSocket::bind("[::1]:0").await.unwrap();
+        app.connect(format!("[::1]:{client_port}")).await.unwrap();
+
+        let compressible: Vec<u8> = (0..2048u32)
+            .flat_map(|i| format!("{:04x}", i % 4096).into_bytes())
+            .collect();
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let incompressible: Vec<u8> = (0..600u32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+
+        for payload in [&compressible, &incompressible] {
+            app.send(payload).await.unwrap();
+            let mut buf = vec![0u8; BUF_SIZE];
+            let resp = tokio::time::timeout(Duration::from_secs(3), app.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(resp.0, payload.len());
+            assert_eq!(&buf[..resp.0], &payload[..]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tcp_compressed_tunnel_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let server_port: u16 = 24020;
+        let client_port: u16 = 24021;
+        let service_port: u16 = 24022;
+
+        let server = Tunnel {
+            protocol: Protocol::Tcp,
+            listen: format!("[::1]:{server_port}"),
+            forward: format!("[::1]:{service_port}"),
+            enable: true,
+            compress: Some(Compression::new(Codec::Zstd, Some(5))),
+        };
+        let client = Tunnel {
+            protocol: Protocol::Tcp,
+            listen: format!("[::1]:{client_port}"),
+            forward: format!("[::1]:{server_port}"),
+            enable: true,
+            compress: Some(Compression::new(Codec::Zstd, None)),
+        };
+
+        let service_listener = TcpListener::bind(format!("[::1]:{service_port}"))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = service_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(sock);
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        tokio::spawn(run_tcp(server));
+        tokio::spawn(run_tcp(client));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let payload: Vec<u8> = (0..20_000u32)
+            .flat_map(|i| format!("{:04x}", i % 4096).into_bytes())
+            .collect();
+
+        let mut app = tokio::net::TcpStream::connect(format!("[::1]:{client_port}"))
+            .await
+            .unwrap();
+        app.write_all(&payload).await.unwrap();
+        app.shutdown().await.unwrap();
+
+        let mut decoded = Vec::new();
+        app.read_to_end(&mut decoded).await.unwrap();
+        assert_eq!(decoded, payload);
     }
 }
