@@ -17,6 +17,7 @@ const TCP_RCV_BUF: usize = 256 * 1024;
 const MIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TIMEOUT: Duration = Duration::from_secs(180);
 const HEARTBEAT_MAGIC: &[u8] = b"IPBR";
+const TCP_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 fn session_timeout(max_gap: Duration) -> Duration {
     (max_gap * 3).clamp(MIN_TIMEOUT, MAX_TIMEOUT)
@@ -426,7 +427,9 @@ async fn handle_tcp_connection(
         let stats = Arc::new(Mutex::new(ByteStats::default()));
         let a = tokio::spawn(pump(in_r, out_w, c, stats.clone()));
         let b = tokio::spawn(pump(out_r, in_w, c, stats.clone()));
+        let reporter = tokio::spawn(report_tcp(stats.clone(), src, forward_addr));
         let _ = tokio::join!(a, b);
+        reporter.abort();
         let st = stats.lock().unwrap();
         if st.payload > 0 {
             info!(
@@ -445,6 +448,23 @@ async fn handle_tcp_connection(
                 src, forward_addr, c2s, s2c,
             ),
             Err(e) => warn!("TCP forwarding error {} <-> {}: {}", src, forward_addr, e),
+        }
+    }
+}
+
+async fn report_tcp(stats: Arc<Mutex<ByteStats>>, src: SocketAddr, forward_addr: SocketAddr) {
+    loop {
+        tokio::time::sleep(TCP_STATS_INTERVAL).await;
+        let st = stats.lock().unwrap();
+        if st.payload > 0 {
+            info!(
+                "TCP active: {} <-> {} compressed {} -> {} bytes ({})",
+                src,
+                forward_addr,
+                st.payload,
+                st.wire,
+                fmt_compress_effect(st.payload, st.wire)
+            );
         }
     }
 }
