@@ -35,14 +35,20 @@ async fn main() {
             Err(e) => exit(&e.to_string()),
         },
         Some(Command::Check) => {
-            let config = TunnelConfig::load(&config_path).unwrap_or_else(|e| exit(&e.to_string()));
+            let config = match cli.resolve_config_path() {
+                Some(path) => TunnelConfig::load(&path).unwrap_or_else(|e| exit(&e.to_string())),
+                None => exit("No config file found. Run `ipbridge init` to generate a template."),
+            };
             for tunnel in &config.tunnel {
                 tunnel::check(tunnel).await;
                 println!();
             }
         }
         Some(Command::Run) | None => {
-            let config = TunnelConfig::load(&config_path).unwrap_or_else(|e| exit(&e.to_string()));
+            let config = match cli.resolve_config_path() {
+                Some(path) => TunnelConfig::load(&path).unwrap_or_else(|e| exit(&e.to_string())),
+                None => exit("No config file found. Run `ipbridge init` to generate a template."),
+            };
 
             tokio::spawn(async {
                 tokio::signal::ctrl_c().await.unwrap();
